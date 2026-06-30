@@ -2,6 +2,7 @@ package traefik_geoblock_mmdb
 
 import (
 	"net"
+	"net/http"
 	"os"
 	"testing"
 )
@@ -62,5 +63,23 @@ func mustCountry(t *testing.T, db *countryDB, ipStr, want string) {
 		t.Errorf("lookup %s = %q, want %q", ipStr, got, want)
 	} else {
 		t.Logf("lookup %-22s -> %q (ok)", ipStr, got)
+	}
+}
+
+// TestNoDatabaseFollowsAllowOnError verifies that when the database is
+// unavailable the decision falls back to allowOnError (and never panics or
+// needs a real .mmdb). This is the "DB missing/unreadable" robustness path.
+func TestNoDatabaseFollowsAllowOnError(t *testing.T) {
+	// A public IP; with no database loaded the country is "undetermined".
+	req := &http.Request{RemoteAddr: "203.0.113.7:443", Header: http.Header{}}
+
+	failOpen := &GeoBlock{allowOnError: true, dbPath: "/does/not/exist.mmdb", allowed: map[string]struct{}{"CH": {}}}
+	if !failOpen.decide(req) {
+		t.Error("no DB + allowOnError=true: want allow, got deny")
+	}
+
+	failClosed := &GeoBlock{allowOnError: false, dbPath: "/does/not/exist.mmdb", allowed: map[string]struct{}{"CH": {}}}
+	if failClosed.decide(req) {
+		t.Error("no DB + allowOnError=false: want deny, got allow")
 	}
 }

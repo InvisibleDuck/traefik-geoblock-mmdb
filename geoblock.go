@@ -19,7 +19,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
+
+// dbReloadInterval throttles how often the middleware retries loading the
+// database while it is unavailable.
+const dbReloadInterval = 30 * time.Second
 
 // Config is the plugin configuration provided via Traefik's dynamic config.
 type Config struct {
@@ -37,9 +43,10 @@ type Config struct {
 	AllowPrivate bool `json:"allowPrivate,omitempty"`
 	// AllowOnError controls what happens when the source country cannot be
 	// determined: the IP is not in the database, the client IP cannot be
-	// parsed, or the lookup/decoder fails (incl. a recovered panic). When false
-	// (the default) such requests are blocked (fail closed); when true they are
-	// ALLOWED (fail open). A request whose country IS determined but is not in
+	// parsed, the lookup/decoder fails (incl. a recovered panic), OR the
+	// database file itself is missing or unreadable. When false (the default)
+	// such requests are blocked (fail closed); when true they are ALLOWED
+	// (fail open). A request whose country IS determined but is not in
 	// AllowedCountries is always blocked, regardless of this setting.
 	AllowOnError bool `json:"allowOnError,omitempty"`
 	// DisallowedStatusCode is the HTTP status returned for blocked requests
@@ -67,17 +74,29 @@ func CreateConfig() *Config {
 type GeoBlock struct {
 	next         http.Handler
 	name         string
-	db           *countryDB
+	dbPath       string
 	allowed      map[string]struct{}
 	allowPriv    bool
 	allowOnError bool
 	denyCode     int
 	ipHeader     string
+
+	// db is loaded lazily/at startup and may be nil while the database file is
+	// unavailable. Guarded by mu together with lastTryNs (the last reload
+	// attempt, unix nanoseconds).
+	mu        sync.RWMutex
+	db        *countryDB
+	lastTryNs int64
 }
 
-// New builds the middleware. Returning an error here fails fast at startup so a
-// misconfiguration (missing db, bad path) is visible in the Traefik logs rather
-// than silently affecting traffic.
+// New builds the middleware.
+//
+// Note: a missing or unreadable database is deliberately NOT a startup error —
+// failing here would make the middleware "not exist" and break every router
+// that references it. Instead the DB is treated as unavailable and requests are
+// handled per allowOnError; database() retries loading it so the plugin
+// self-heals once the file appears. Genuine authoring mistakes (no path, empty
+// allow-list) still fail fast.
 func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.Handler, error) {
 	if cfg == nil || !cfg.Enabled {
 		// Disabled: transparent pass-through.
@@ -88,10 +107,6 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 	}
 	if len(cfg.AllowedCountries) == 0 {
 		return nil, errors.New("geoblock: allowedCountries is empty (would block everything)")
-	}
-	db, err := openCountryDB(cfg.DatabaseFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("geoblock: loading %q: %w", cfg.DatabaseFilePath, err)
 	}
 	allowed := make(map[string]struct{}, len(cfg.AllowedCountries))
 	for _, c := range cfg.AllowedCountries {
@@ -104,16 +119,23 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 	if code == 0 {
 		code = http.StatusForbidden
 	}
-	return &GeoBlock{
+	g := &GeoBlock{
 		next:         next,
 		name:         name,
-		db:           db,
+		dbPath:       cfg.DatabaseFilePath,
 		allowed:      allowed,
 		allowPriv:    cfg.AllowPrivate,
 		allowOnError: cfg.AllowOnError,
 		denyCode:     code,
 		ipHeader:     strings.TrimSpace(cfg.ClientIPHeader),
-	}, nil
+	}
+	if db, err := openCountryDB(cfg.DatabaseFilePath); err != nil {
+		log.Printf("geoblock(%s): WARNING could not load %q at startup; requests handled per allowOnError=%t until it becomes available: %v",
+			name, cfg.DatabaseFilePath, cfg.AllowOnError, err)
+	} else {
+		g.db = db
+	}
+	return g, nil
 }
 
 func (g *GeoBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -127,8 +149,8 @@ func (g *GeoBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 // decide returns whether the request is allowed. It performs no I/O on the
 // response and never calls next, so it can be wrapped in a panic recover
 // without risking a double-serve of the downstream handler. Any panic, lookup
-// error, unparseable IP, or "country not in database" result is resolved via
-// allowOnError (fail open / fail closed).
+// error, unparseable IP, or unavailable database resolves via allowOnError
+// (fail open / fail closed).
 func (g *GeoBlock) decide(req *http.Request) (allow bool) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -146,7 +168,13 @@ func (g *GeoBlock) decide(req *http.Request) (allow bool) {
 		return true
 	}
 
-	country, err := g.db.lookupCountry(ip)
+	db := g.database()
+	if db == nil {
+		// Database missing/unreadable -> country cannot be determined.
+		return g.allowOnError
+	}
+
+	country, err := db.lookupCountry(ip)
 	if err != nil || country == "" {
 		// Lookup error, or the IP is not present in the database.
 		return g.allowOnError
@@ -154,6 +182,37 @@ func (g *GeoBlock) decide(req *http.Request) (allow bool) {
 	// Country determined: strict allow-list (this case ignores allowOnError).
 	_, ok := g.allowed[country]
 	return ok
+}
+
+// database returns the loaded country DB, or nil if it is currently
+// unavailable. If unavailable, it retries loading at most once per
+// dbReloadInterval so the plugin recovers automatically once the file appears
+// (e.g. after a geoipupdate sidecar's first run) without a Traefik restart.
+func (g *GeoBlock) database() *countryDB {
+	g.mu.RLock()
+	db := g.db
+	g.mu.RUnlock()
+	if db != nil {
+		return db
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.db != nil { // loaded by another goroutine in the meantime
+		return g.db
+	}
+	now := time.Now().UnixNano()
+	if g.lastTryNs != 0 && now-g.lastTryNs < int64(dbReloadInterval) {
+		return nil // retried too recently
+	}
+	g.lastTryNs = now
+	loaded, err := openCountryDB(g.dbPath)
+	if err != nil {
+		return nil
+	}
+	g.db = loaded
+	log.Printf("geoblock(%s): database %s is now available and active", g.name, g.dbPath)
+	return loaded
 }
 
 // clientIP resolves the source IP. Default = TCP peer (req.RemoteAddr), which is

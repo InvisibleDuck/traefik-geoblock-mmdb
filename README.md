@@ -21,7 +21,7 @@ directly.
 | `databaseFilePath`     | string     | —       | Path *inside the container* to `GeoLite2-Country.mmdb`. Required. |
 | `allowedCountries`     | []string   | —       | ISO 3166-1 alpha-2 codes that are allowed (e.g. `CH`, `LI`). Required. |
 | `allowPrivate`         | bool       | `false` | Allow private / loopback / link-local source IPs without a lookup. |
-| `allowOnError`         | bool       | `false` | Behaviour when the source country **cannot be determined** (IP not in the DB, unparseable client IP, or a lookup/decoder error): allow the request (`true`, fail-open) or block it (`false`, fail-closed). A country that **is** determined but not in `allowedCountries` is always blocked. |
+| `allowOnError`         | bool       | `false` | Behaviour when the source country **cannot be determined** — IP not in the DB, unparseable client IP, a lookup/decoder error, **or the database file is missing/unreadable**: allow the request (`true`, fail-open) or block it (`false`, fail-closed). A country that **is** determined but not in `allowedCountries` is always blocked. |
 | `disallowedStatusCode` | int        | `403`   | HTTP status returned for blocked requests. |
 | `clientIPHeader`       | string     | `""`    | **Leave empty unless Traefik is behind a trusted upstream proxy.** If set (e.g. `CF-Connecting-IP`), the source IP is taken from this header instead of the TCP peer. See the security note below. |
 
@@ -41,6 +41,13 @@ request is **blocked by default** (`allowOnError: false`, fail closed); set
 `allowOnError: true` to let such requests through instead (fail open). A country
 that *is* resolved but not allow-listed is always blocked.
 
+A **missing or unreadable database** is handled the same way and, importantly,
+**never fails Traefik startup** (which would otherwise make the middleware "not
+exist" and break every router using it). The plugin serves per `allowOnError`
+and keeps retrying to load the database in the background, so it recovers
+automatically once the file appears — e.g. after a `geoipupdate` sidecar's first
+run.
+
 ## Installation
 
 Traefik downloads the plugin from GitHub (via the Traefik Plugin Catalog) — there
@@ -55,7 +62,7 @@ experimental:
   plugins:
     geoblock:
       moduleName: github.com/smiso/traefik-geoblock-mmdb
-      version: v0.2.1
+      version: v0.3.0
 ```
 
 **2. Define the middleware(s)** in the **dynamic** configuration (`config.yml`),
