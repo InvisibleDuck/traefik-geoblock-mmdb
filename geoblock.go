@@ -1,13 +1,9 @@
-// Package traefik_geoblock_mmdb is a local Traefik middleware plugin that
-// allow-lists requests by country using a MaxMind GeoLite2-Country .mmdb file.
+// Package traefik_geoblock_mmdb is a Traefik middleware plugin that allow-lists
+// requests by country using a MaxMind GeoLite2-Country .mmdb file.
 //
-// It has NO third-party dependencies (a small, self-contained MaxMind DB
-// reader is included below) and makes NO external API calls, so it runs under
-// Yaegi as a local plugin without vendoring and without network access.
-//
-// Config keys are intentionally compatible with nscuro/traefik-plugin-geoblock
-// (enabled, databaseFilePath, allowPrivate, allowedCountries) so migrating is a
-// one-line change of databaseFilePath.
+// It has no third-party dependencies (a small, self-contained MaxMind DB reader
+// is included below) and makes no external API calls, so it runs under Yaegi
+// without vendoring and without network access.
 //
 // This product includes GeoLite2 data created by MaxMind, available from
 // https://www.maxmind.com.
@@ -28,17 +24,24 @@ import (
 // Config is the plugin configuration provided via Traefik's dynamic config.
 type Config struct {
 	// Enabled toggles the middleware. When false the request passes through
-	// untouched (parity with nscuro's `enabled`).
+	// untouched.
 	Enabled bool `json:"enabled,omitempty"`
 	// DatabaseFilePath is the path (inside the Traefik container) to the
-	// MaxMind GeoLite2-Country .mmdb file, e.g. /plugins-storage/GeoLite2-Country.mmdb
+	// MaxMind GeoLite2-Country .mmdb file, e.g. /geoip/GeoLite2-Country.mmdb
 	DatabaseFilePath string `json:"databaseFilePath,omitempty"`
 	// AllowedCountries is the ISO 3166-1 alpha-2 allow-list (e.g. CH, LI).
 	// A request is allowed only if its source country is in this list.
 	AllowedCountries []string `json:"allowedCountries,omitempty"`
 	// AllowPrivate allows private / loopback / link-local source IPs without a
-	// country lookup (parity with nscuro's `allowPrivate`).
+	// country lookup.
 	AllowPrivate bool `json:"allowPrivate,omitempty"`
+	// AllowOnError controls what happens when the source country cannot be
+	// determined: the IP is not in the database, the client IP cannot be
+	// parsed, or the lookup/decoder fails (incl. a recovered panic). When false
+	// (the default) such requests are blocked (fail closed); when true they are
+	// ALLOWED (fail open). A request whose country IS determined but is not in
+	// AllowedCountries is always blocked, regardless of this setting.
+	AllowOnError bool `json:"allowOnError,omitempty"`
 	// DisallowedStatusCode is the HTTP status returned for blocked requests
 	// (default 403).
 	DisallowedStatusCode int `json:"disallowedStatusCode,omitempty"`
@@ -54,24 +57,27 @@ type Config struct {
 // CreateConfig returns the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
+		// Fail closed by default: if the country can't be determined, block.
+		// Set allowOnError: true to allow such requests instead (fail open).
 		DisallowedStatusCode: http.StatusForbidden,
 	}
 }
 
 // GeoBlock is the middleware handler.
 type GeoBlock struct {
-	next      http.Handler
-	name      string
-	db        *countryDB
-	allowed   map[string]struct{}
-	allowPriv bool
-	denyCode  int
-	ipHeader  string
+	next         http.Handler
+	name         string
+	db           *countryDB
+	allowed      map[string]struct{}
+	allowPriv    bool
+	allowOnError bool
+	denyCode     int
+	ipHeader     string
 }
 
 // New builds the middleware. Returning an error here fails fast at startup so a
 // misconfiguration (missing db, bad path) is visible in the Traefik logs rather
-// than silently letting traffic through.
+// than silently affecting traffic.
 func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.Handler, error) {
 	if cfg == nil || !cfg.Enabled {
 		// Disabled: transparent pass-through.
@@ -98,47 +104,58 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 	if code == 0 {
 		code = http.StatusForbidden
 	}
-	log.Printf("geoblock(%s): loaded %s (record_size=%d, nodes=%d), allowing %d countries",
-		name, cfg.DatabaseFilePath, db.recordSize, db.nodeCount, len(allowed))
+	log.Printf("geoblock(%s): loaded %s (record_size=%d, nodes=%d), allowing %d countries, allowOnError=%t",
+		name, cfg.DatabaseFilePath, db.recordSize, db.nodeCount, len(allowed), cfg.AllowOnError)
 	return &GeoBlock{
-		next:      next,
-		name:      name,
-		db:        db,
-		allowed:   allowed,
-		allowPriv: cfg.AllowPrivate,
-		denyCode:  code,
-		ipHeader:  strings.TrimSpace(cfg.ClientIPHeader),
+		next:         next,
+		name:         name,
+		db:           db,
+		allowed:      allowed,
+		allowPriv:    cfg.AllowPrivate,
+		allowOnError: cfg.AllowOnError,
+		denyCode:     code,
+		ipHeader:     strings.TrimSpace(cfg.ClientIPHeader),
 	}, nil
 }
 
 func (g *GeoBlock) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// Never let a decoder edge case panic the router; fail closed (deny) instead.
+	if g.decide(req) {
+		g.next.ServeHTTP(rw, req)
+		return
+	}
+	http.Error(rw, "Forbidden", g.denyCode)
+}
+
+// decide returns whether the request is allowed. It performs no I/O on the
+// response and never calls next, so it can be wrapped in a panic recover
+// without risking a double-serve of the downstream handler. Any panic, lookup
+// error, unparseable IP, or "country not in database" result is resolved via
+// allowOnError (fail open / fail closed).
+func (g *GeoBlock) decide(req *http.Request) (allow bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("geoblock(%s): recovered from panic, denying: %v", g.name, r)
-			http.Error(rw, "Forbidden", g.denyCode)
+			log.Printf("geoblock(%s): recovered from panic, allowOnError=%t: %v", g.name, g.allowOnError, r)
+			allow = g.allowOnError
 		}
 	}()
 
 	ip := g.clientIP(req)
 	if ip == nil {
-		http.Error(rw, "Forbidden", g.denyCode)
-		return
+		// Source IP could not be determined.
+		return g.allowOnError
 	}
 	if g.allowPriv && isPrivate(ip) {
-		g.next.ServeHTTP(rw, req)
-		return
+		return true
 	}
 
 	country, err := g.db.lookupCountry(ip)
-	if err == nil && country != "" {
-		if _, ok := g.allowed[country]; ok {
-			g.next.ServeHTTP(rw, req)
-			return
-		}
+	if err != nil || country == "" {
+		// Lookup error, or the IP is not present in the database.
+		return g.allowOnError
 	}
-	// Allow-list semantics: unknown country or lookup error => deny.
-	http.Error(rw, "Forbidden", g.denyCode)
+	// Country determined: strict allow-list (this case ignores allowOnError).
+	_, ok := g.allowed[country]
+	return ok
 }
 
 // clientIP resolves the source IP. Default = TCP peer (req.RemoteAddr), which is
