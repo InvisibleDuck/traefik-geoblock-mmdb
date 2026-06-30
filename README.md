@@ -55,7 +55,7 @@ experimental:
   plugins:
     geoblock:
       moduleName: github.com/smiso/traefik-geoblock-mmdb
-      version: v0.1.0
+      version: v0.2.0
 ```
 
 **2. Define the middleware(s)** in the **dynamic** configuration (`config.yml`),
