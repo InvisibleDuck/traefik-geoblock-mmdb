@@ -1,0 +1,66 @@
+package traefik_geoblock_mmdb
+
+import (
+	"net"
+	"os"
+	"testing"
+)
+
+// TestLookup validates the embedded mmdb reader against a real MaxMind
+// GeoLite2-Country.mmdb. It is skipped unless GEOBLOCK_TEST_DB points at one.
+//
+// With local Go:
+//
+//	GEOBLOCK_TEST_DB=/path/to/GeoLite2-Country.mmdb go test -run TestLookup -v
+//
+// Without local Go, via a throwaway container (adjust the host paths):
+//
+//	docker run --rm \
+//	  -e GEOBLOCK_TEST_DB=/db/GeoLite2-Country.mmdb \
+//	  -v "D:/Git/traefik-geoblock-mmdb:/src" \
+//	  -v "D:/Claude/proxy/data/geoip:/db" \
+//	  -w /src golang:1.23 go test -run TestLookup -v
+func TestLookup(t *testing.T) {
+	path := os.Getenv("GEOBLOCK_TEST_DB")
+	if path == "" {
+		t.Skip("set GEOBLOCK_TEST_DB to a GeoLite2-Country.mmdb path to run this test")
+	}
+	db, err := openCountryDB(path)
+	if err != nil {
+		t.Fatalf("openCountryDB: %v", err)
+	}
+	t.Logf("loaded db: record_size=%d node_count=%d ip_version=%d", db.recordSize, db.nodeCount, db.ipVersion)
+
+	// 8.8.8.8 (Google) resolves to US in every GeoLite2-Country build — a hard assertion.
+	mustCountry(t, db, "8.8.8.8", "US")
+
+	// Private addresses are not in the DB -> empty result (allowPrivate handles them).
+	mustCountry(t, db, "192.168.1.1", "")
+
+	// Informational lookups — printed, not asserted (values can shift between DB builds).
+	for _, ip := range []string{"1.1.1.1", "195.176.0.1", "2a02:1205::1", "2001:4860:4860::8888"} {
+		got, err := db.lookupCountry(net.ParseIP(ip))
+		if err != nil {
+			t.Errorf("lookup %s: unexpected error %v", ip, err)
+			continue
+		}
+		t.Logf("lookup %-22s -> %q", ip, got)
+	}
+}
+
+func mustCountry(t *testing.T, db *countryDB, ipStr, want string) {
+	t.Helper()
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		t.Fatalf("bad test IP %q", ipStr)
+	}
+	got, err := db.lookupCountry(ip)
+	if err != nil {
+		t.Fatalf("lookup %s: %v", ipStr, err)
+	}
+	if got != want {
+		t.Errorf("lookup %s = %q, want %q", ipStr, got, want)
+	} else {
+		t.Logf("lookup %-22s -> %q (ok)", ipStr, got)
+	}
+}
