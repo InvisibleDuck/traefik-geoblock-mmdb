@@ -104,8 +104,6 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 	if code == 0 {
 		code = http.StatusForbidden
 	}
-	log.Printf("geoblock(%s): loaded %s (record_size=%d, nodes=%d), allowing %d countries, allowOnError=%t",
-		name, cfg.DatabaseFilePath, db.recordSize, db.nodeCount, len(allowed), cfg.AllowOnError)
 	return &GeoBlock{
 		next:         next,
 		name:         name,
