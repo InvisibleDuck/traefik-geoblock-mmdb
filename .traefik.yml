@@ -1,6 +1,6 @@
 displayName: GeoBlock MMDB
 type: middleware
-import: github.com/smiso/traefik-geoblock-mmdb
+import: github.com/InvisibleDuck/traefik-geoblock-mmdb
 summary: >-
   Country allow-listing from a local MaxMind GeoLite2-Country .mmdb file.
   No external API calls, zero third-party dependencies.

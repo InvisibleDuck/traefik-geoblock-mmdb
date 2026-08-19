@@ -13,6 +13,11 @@ directly.
 > This product includes GeoLite2 data created by MaxMind, available from
 > <https://www.maxmind.com>.
 
+> Fork of [smiso/traefik-geoblock-mmdb](https://github.com/smiso/traefik-geoblock-mmdb),
+> maintained here while upstream is inactive. Includes the fix for the Yaegi
+> panic on EU-country lookups (upstream PR #1, by
+> [@reniko](https://github.com/reniko)).
+
 ## Configuration
 
 | Key                    | Type       | Default | Description |
@@ -61,8 +66,8 @@ manifest (included here), and the `traefik-plugin` topic so the catalog indexes 
 experimental:
   plugins:
     geoblock:
-      moduleName: github.com/smiso/traefik-geoblock-mmdb
-      version: v0.3.0
+      moduleName: github.com/InvisibleDuck/traefik-geoblock-mmdb
+      version: v0.3.1
 ```
 
 **2. Define the middleware(s)** in the **dynamic** configuration (`config.yml`),
