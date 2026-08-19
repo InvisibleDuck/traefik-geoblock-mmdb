@@ -1,0 +1,11 @@
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      # QF1002 (use a tagged switch) fires on the mmdb size decoder. The
+      # rewrite is purely cosmetic, and that decoder is both security-relevant
+      # and sensitive to how Yaegi interprets it, so it is left alone
+      # deliberately rather than churned to satisfy a quickfix hint.
+      - linters: [staticcheck]
+        text: "QF1002"

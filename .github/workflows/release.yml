@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  YAEGI_VERSION: v0.16.1
+
+jobs:
+  release:
+    name: Verify & publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      # A tag is what users install, and Traefik caches plugin sources by
+      # version, so a broken tag is expensive to walk back. Re-run everything
+      # here rather than trusting that the branch was green.
+      - name: Test
+        run: go test -v -cover ./...
+
+      - name: Install Yaegi ${{ env.YAEGI_VERSION }}
+        run: go install github.com/traefik/yaegi/cmd/yaegi@${{ env.YAEGI_VERSION }}
+
+      - name: Test under Yaegi
+        run: yaegi test -v .
+
+      - name: Manifest matches module path
+        run: |
+          module="$(awk '/^module /{print $2; exit}' go.mod)"
+          manifest="$(awk '/^import:/{print $2; exit}' .traefik.yml)"
+          if [ "$module" != "$manifest" ]; then
+            echo "::error file=.traefik.yml::import ($manifest) != go.mod module ($module)"
+            exit 1
+          fi
+
+      # The catalog reads these; a tag missing one of them fails to index.
+      - name: Manifest is complete
+        run: |
+          for key in displayName type import summary; do
+            if ! grep -qE "^${key}:" .traefik.yml; then
+              echo "::error file=.traefik.yml::missing required key '${key}'"
+              exit 1
+            fi
+          done
+          type="$(awk '/^type:/{print $2; exit}' .traefik.yml)"
+          if [ "$type" != "middleware" ]; then
+            echo "::error file=.traefik.yml::type must be 'middleware', got '$type'"
+            exit 1
+          fi
+
+      # The README tells users which version to pin. If it lags the tag,
+      # everyone installs the previous release.
+      - name: README documents this version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          documented="$(grep -oE '^[[:space:]]*version: v[0-9]+\.[0-9]+\.[0-9]+' README.md | head -1 | awk '{print $2}')"
+          echo "tag: $tag / README: $documented"
+          if [ "$tag" != "$documented" ]; then
+            echo "::error file=README.md::README pins '$documented' but the tag is '$tag'"
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag

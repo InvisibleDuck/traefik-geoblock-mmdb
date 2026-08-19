@@ -1,0 +1,96 @@
+name: Main
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  YAEGI_VERSION: v0.16.1
+
+jobs:
+  build:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false # nothing to cache: this module has no dependencies
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on: $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2 # renovate: golangci-lint
+
+      - name: Test
+        run: go test -v -cover ./...
+
+      # The load-bearing check. Traefik does not compile this plugin, it
+      # interprets it with Yaegi, and Yaegi diverges from the compiler on
+      # things `go test` cannot see (see CLAUDE.md, "Yaegi-only failure
+      # modes"). A green `go test` alone does not mean the plugin works.
+      - name: Install Yaegi ${{ env.YAEGI_VERSION }}
+        run: go install github.com/traefik/yaegi/cmd/yaegi@${{ env.YAEGI_VERSION }}
+
+      - name: Test under Yaegi
+        run: yaegi test -v .
+
+  invariants:
+    name: Plugin invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      # Yaegi loads this plugin from source with no build step, so a single
+      # third-party import makes it unloadable in Traefik. Nothing else stops
+      # a dependency from creeping in, so it is enforced here.
+      - name: Enforce zero dependencies
+        run: |
+          if grep -qE '^[[:space:]]*require' go.mod; then
+            echo "::error file=go.mod::plugin must stay dependency-free (Yaegi loads it from source)"
+            exit 1
+          fi
+          if [ -d vendor ]; then
+            echo "::error::vendor/ must not exist; it breaks Yaegi plugin loading"
+            exit 1
+          fi
+
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      # Traefik resolves the plugin by the module path in .traefik.yml. If it
+      # drifts from go.mod, the catalog silently fails to find the plugin.
+      - name: Manifest matches module path
+        run: |
+          module="$(awk '/^module /{print $2; exit}' go.mod)"
+          manifest="$(awk '/^import:/{print $2; exit}' .traefik.yml)"
+          echo "go.mod module: $module"
+          echo ".traefik.yml import: $manifest"
+          if [ "$module" != "$manifest" ]; then
+            echo "::error file=.traefik.yml::import ($manifest) != go.mod module ($module)"
+            exit 1
+          fi

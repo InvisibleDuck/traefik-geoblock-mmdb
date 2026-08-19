@@ -1,0 +1,25 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":separateMajorReleases"
+  ],
+  "customManagers": [
+    {
+      "description": "Keep the pinned Yaegi version in the workflows current",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["YAEGI_VERSION:\\s*(?<currentValue>v[\\d.]+)"],
+      "depNameTemplate": "traefik/yaegi",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "Keep the golangci-lint version passed to the action current",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["version:\\s*(?<currentValue>v2[\\d.]+)\\s*# renovate: golangci-lint"],
+      "depNameTemplate": "golangci/golangci-lint",
+      "datasourceTemplate": "github-releases"
+    }
+  ]
+}
