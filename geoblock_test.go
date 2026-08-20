@@ -107,3 +107,51 @@ func TestNoDatabaseFollowsAllowOnError(t *testing.T) {
 		t.Error("no DB + allowOnError=false: want deny, got allow")
 	}
 }
+
+// TestBypassIPsAllowWithoutLookup verifies that a source IP matching bypassIPs
+// is allowed with no database lookup at all. allowOnError is false and the
+// database path does not exist, so anything reaching the lookup is denied —
+// an "allow" result therefore proves the bypass fired.
+func TestBypassIPsAllowWithoutLookup(t *testing.T) {
+	g := &GeoBlock{
+		allowOnError: false,
+		dbPath:       "/does/not/exist.mmdb",
+		allowed:      map[string]struct{}{"CH": {}},
+		bypass:       parseIPNets([]string{"203.0.113.7", "198.51.100.0/24", "2001:db8::/32"}, "test"),
+	}
+
+	allowed := []string{"203.0.113.7:443", "198.51.100.42:443", "[2001:db8::1]:443"}
+	for _, addr := range allowed {
+		if !g.decide(&http.Request{RemoteAddr: addr, Header: http.Header{}}) {
+			t.Errorf("%s: want allow (bypassIPs match), got deny", addr)
+		}
+	}
+
+	denied := []string{"203.0.113.8:443", "198.51.101.1:443", "[2001:db9::1]:443"}
+	for _, addr := range denied {
+		if g.decide(&http.Request{RemoteAddr: addr, Header: http.Header{}}) {
+			t.Errorf("%s: want deny (outside bypassIPs, allowOnError=false), got allow", addr)
+		}
+	}
+}
+
+// TestParseIPNetsSkipsInvalidEntries verifies that malformed entries are
+// dropped instead of failing the middleware, and that dropping them fails in
+// the safe direction: the address they were meant to cover is not bypassed.
+func TestParseIPNetsSkipsInvalidEntries(t *testing.T) {
+	nets := parseIPNets([]string{"10.0.0/8", "not-an-ip", "", "  ", "192.0.2.0/24", " 203.0.113.7 "}, "test")
+	if len(nets) != 2 {
+		t.Fatalf("parseIPNets kept %d entries, want 2: %v", len(nets), nets)
+	}
+
+	g := &GeoBlock{allowOnError: false, dbPath: "/does/not/exist.mmdb", allowed: map[string]struct{}{"CH": {}}, bypass: nets}
+	if !g.decide(&http.Request{RemoteAddr: "192.0.2.5:443", Header: http.Header{}}) {
+		t.Error("192.0.2.5: want allow (valid CIDR entry), got deny")
+	}
+	if !g.decide(&http.Request{RemoteAddr: "203.0.113.7:443", Header: http.Header{}}) {
+		t.Error("203.0.113.7: want allow (valid host entry, whitespace trimmed), got deny")
+	}
+	if g.decide(&http.Request{RemoteAddr: "10.1.2.3:443", Header: http.Header{}}) {
+		t.Error("10.1.2.3: want deny (invalid entry \"10.0.0/8\" must be ignored), got allow")
+	}
+}

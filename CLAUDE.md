@@ -53,7 +53,8 @@ of `geoblock_test.go` for the exact `docker run` invocation).
 
 `geoblock.go` has two clearly separated halves, split by the banner comment around line 263:
 
-1. **Middleware** — `Config`, `New`, `ServeHTTP`, `decide`, `database`, `clientIP`, `isPrivate`.
+1. **Middleware** — `Config`, `New`, `ServeHTTP`, `decide`, `database`, `clientIP`, `parseIPNets`,
+   `isBypassed`, `isPrivate`.
 2. **Embedded mmdb reader** — `countryDB`, `openCountryDB`, `lookupCountry`, `readNode`, `decode`.
    A country-lookup-only subset of the MaxMind DB format (https://maxmind.github.io/MaxMind-DB/):
    it walks the binary search tree and decodes just enough of the data section to reach
@@ -72,6 +73,7 @@ The allow-list is strict, and `allowOnError` only covers the *undetermined* case
 |---|---|
 | Country resolved and in `allowedCountries` | allow |
 | Country resolved but not allow-listed | **block, always** — `allowOnError` is ignored here |
+| Source IP matches `bypassIPs` | allow, no lookup (checked first) |
 | Private/loopback/link-local IP with `allowPrivate` | allow, no lookup |
 | Country undetermined (IP not in DB, unparseable IP, decode error, panic, **or DB missing**) | `allowOnError` |
 
