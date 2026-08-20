@@ -26,6 +26,7 @@ directly.
 | `databaseFilePath`     | string     | —       | Path *inside the container* to `GeoLite2-Country.mmdb`. Required. |
 | `allowedCountries`     | []string   | —       | ISO 3166-1 alpha-2 codes that are allowed (e.g. `CH`, `LI`). Required. |
 | `allowPrivate`         | bool       | `false` | Allow private / loopback / link-local source IPs without a lookup. |
+| `bypassIPs`            | []string   | `[]`    | Source IPs / CIDR blocks that skip the country lookup entirely and are always allowed (e.g. an office/VPN egress address or a monitoring probe). A bare address is treated as a single host (`/32` or `/128`). Invalid entries are logged and ignored. |
 | `allowOnError`         | bool       | `false` | Behaviour when the source country **cannot be determined** — IP not in the DB, unparseable client IP, a lookup/decoder error, **or the database file is missing/unreadable**: allow the request (`true`, fail-open) or block it (`false`, fail-closed). A country that **is** determined but not in `allowedCountries` is always blocked. |
 | `disallowedStatusCode` | int        | `403`   | HTTP status returned for blocked requests. |
 | `clientIPHeader`       | string     | `""`    | **Leave empty unless Traefik is behind a trusted upstream proxy.** If set (e.g. `CF-Connecting-IP`), the source IP is taken from this header instead of the TCP peer. See the security note below. |
@@ -45,6 +46,14 @@ determined** (IP not in the DB, unparseable client IP, or a lookup error) the
 request is **blocked by default** (`allowOnError: false`, fail closed); set
 `allowOnError: true` to let such requests through instead (fail open). A country
 that *is* resolved but not allow-listed is always blocked.
+
+`bypassIPs` is checked **first**, before `allowPrivate` and before any database
+lookup: a matching source IP is allowed outright, whatever its country. It is the
+way to let through an address that would otherwise be blocked by the country
+allow-list — an office/VPN egress IP abroad, an uptime checker, a partner range.
+Note that a bypass entry is only as trustworthy as the source IP it matches
+against: with `clientIPHeader` set, anyone who can forge that header can claim a
+bypassed address.
 
 A **missing or unreadable database** is handled the same way and, importantly,
 **never fails Traefik startup** (which would otherwise make the middleware "not
@@ -85,6 +94,10 @@ http:
           allowedCountries:
             - CH
             - LI
+          # Optional: always allowed, no country lookup.
+          bypassIPs:
+            - 203.0.113.7
+            - 198.51.100.0/24
 ```
 
 **3. Attach** the middleware to a router (via labels or file provider) as usual.

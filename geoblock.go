@@ -41,6 +41,12 @@ type Config struct {
 	// AllowPrivate allows private / loopback / link-local source IPs without a
 	// country lookup.
 	AllowPrivate bool `json:"allowPrivate,omitempty"`
+	// BypassIPs lists source IPs and CIDR blocks that skip the country lookup
+	// entirely and are always allowed - e.g. an office/VPN egress address, a
+	// monitoring probe, or a partner range in a non-allow-listed country. A bare
+	// address is treated as a single host (/32 or /128). Entries that are not a
+	// valid IP or CIDR are logged and ignored.
+	BypassIPs []string `json:"bypassIPs,omitempty"`
 	// AllowOnError controls what happens when the source country cannot be
 	// determined: the IP is not in the database, the client IP cannot be
 	// parsed, the lookup/decoder fails (incl. a recovered panic), OR the
@@ -77,6 +83,7 @@ type GeoBlock struct {
 	dbPath       string
 	allowed      map[string]struct{}
 	allowPriv    bool
+	bypass       []*net.IPNet
 	allowOnError bool
 	denyCode     int
 	ipHeader     string
@@ -125,6 +132,7 @@ func New(_ context.Context, next http.Handler, cfg *Config, name string) (http.H
 		dbPath:       cfg.DatabaseFilePath,
 		allowed:      allowed,
 		allowPriv:    cfg.AllowPrivate,
+		bypass:       parseIPNets(cfg.BypassIPs, name),
 		allowOnError: cfg.AllowOnError,
 		denyCode:     code,
 		ipHeader:     strings.TrimSpace(cfg.ClientIPHeader),
@@ -163,6 +171,10 @@ func (g *GeoBlock) decide(req *http.Request) (allow bool) {
 	if ip == nil {
 		// Source IP could not be determined.
 		return g.allowOnError
+	}
+	if g.isBypassed(ip) {
+		// Explicitly listed by the operator: no lookup at all.
+		return true
 	}
 	if g.allowPriv && isPrivate(ip) {
 		return true
@@ -234,6 +246,54 @@ func (g *GeoBlock) clientIP(req *http.Request) net.IP {
 		host = req.RemoteAddr
 	}
 	return net.ParseIP(strings.TrimSpace(host))
+}
+
+// parseIPNets converts IP / CIDR strings into networks. A bare address becomes
+// a single-host network (/32 or /128). Invalid entries are logged and skipped
+// rather than failing New: an error there would make the middleware "not exist"
+// and break every router referencing it, whereas a dropped entry merely means
+// the country check still applies to that address.
+func parseIPNets(entries []string, name string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(entries))
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if strings.Contains(e, "/") {
+			_, n, err := net.ParseCIDR(e)
+			if err != nil {
+				log.Printf("geoblock(%s): WARNING ignoring invalid bypassIPs entry %q: %v", name, e, err)
+				continue
+			}
+			nets = append(nets, n)
+			continue
+		}
+		ip := net.ParseIP(e)
+		if ip == nil {
+			log.Printf("geoblock(%s): WARNING ignoring invalid bypassIPs entry %q: not an IP address", name, e)
+			continue
+		}
+		bits := 8 * net.IPv6len
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+			bits = 8 * net.IPv4len
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return nets
+}
+
+// isBypassed reports whether ip is covered by one of the configured bypass
+// networks. net.IPNet.Contains normalises 4-in-6 addresses itself, so an IPv4
+// address arriving as ::ffff:a.b.c.d still matches an IPv4 block.
+func (g *GeoBlock) isBypassed(ip net.IP) bool {
+	for _, n := range g.bypass {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func isPrivate(ip net.IP) bool {
